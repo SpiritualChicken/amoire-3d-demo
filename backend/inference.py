@@ -96,7 +96,7 @@ def load_model():
         from llava.model.builder import load_pretrained_model
         from llava.mm_utils import get_model_name_from_path
 
-        model_name = get_model_name_from_path(str(LLAVA_MODEL_PATH))
+        model_name = "llava-v1.5-7b-lora"
 
         # Load with 4-bit quantization to reduce VRAM (~14GB → ~6GB)
         load_kwargs = {}
