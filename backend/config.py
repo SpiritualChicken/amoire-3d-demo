@@ -21,7 +21,7 @@ CONTOURCRAFT_DIR = ML_DIR / "ContourCraft-CG"
 
 # Model weights
 LLAVA_MODEL_PATH = CHATGARMENT_DIR / "checkpoints" / "llava-v1.5-7b"
-LORA_WEIGHTS_PATH = CHATGARMENT_DIR / "checkpoints" / "chatgarment-lora"
+LORA_WEIGHTS_PATH = CHATGARMENT_DIR / "checkpoints" / "try_7b_lr1e_4_v3_garmentcontrol_4h100_v4_final"
 
 # Data directories
 UPLOAD_DIR = DATA_DIR / "uploads"
