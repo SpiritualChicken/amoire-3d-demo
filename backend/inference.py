@@ -185,6 +185,7 @@ def load_model():
             mm_use_im_start_end=False,
             mm_use_im_patch_token=False,
             mm_projector_type="mlp2x_gelu",
+            pretrain_mm_mlp_adapter=None,
         )
         model.get_model().initialize_vision_modules(
             model_args=vision_cfg, fsdp=None
