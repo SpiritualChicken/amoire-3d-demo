@@ -113,16 +113,31 @@ export default function Home() {
     (url: string) => {
       setError(null);
 
-      // If it's a demo mesh URL (local path), use directly
-      if (url.startsWith("/")) {
+      // If it's a demo mesh URL (local sample path), use directly
+      if (url.startsWith("/sample-meshes/")) {
         setMeshUrl(url);
         const demoItem = DEMO_GARMENTS.find((g) => g.meshUrl === url);
         setActiveGalleryId(demoItem?.id ?? null);
         return;
       }
 
-      // API mesh URL — fetch the blob
+      // API mesh URL — extract job ID and fetch via API client
       setGenerating(true);
+      const jobIdMatch = url.match(/\/api\/mesh\/(.+)/);
+      if (jobIdMatch) {
+        getMesh(jobIdMatch[1])
+          .then((blob) => {
+            setMeshUrl(URL.createObjectURL(blob));
+            setGenerating(false);
+          })
+          .catch(() => {
+            setError("Failed to load mesh");
+            setGenerating(false);
+          });
+        return;
+      }
+
+      // Full URL — fetch directly
       fetch(url)
         .then((res) => res.blob())
         .then((blob) => {
