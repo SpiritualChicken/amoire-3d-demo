@@ -259,7 +259,7 @@ async def health():
         if torch.cuda.is_available():
             gpu_info = {
                 "name": torch.cuda.get_device_name(0),
-                "memory_total_mb": torch.cuda.get_device_properties(0).total_mem // (1024 * 1024),
+                "memory_total_mb": torch.cuda.get_device_properties(0).total_memory // (1024 * 1024),
                 "memory_used_mb": torch.cuda.memory_allocated(0) // (1024 * 1024),
             }
     except ImportError:
