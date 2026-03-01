@@ -208,17 +208,41 @@ def _run_vlm_inference(image_path: Path) -> tuple[str, dict]:
     elif "```" in json_text:
         json_text = json_text.split("```")[1].split("```")[0].strip()
 
+    # Clean up common model output issues before parsing
+    def _clean_json_text(text: str) -> str:
+        """Fix Python-style dict output to valid JSON."""
+        import ast
+        # Try Python literal eval first (handles single quotes, True/False/None)
+        try:
+            start = text.find("{")
+            end = text.rfind("}") + 1
+            if start >= 0 and end > start:
+                py_dict = ast.literal_eval(text[start:end])
+                return json.dumps(py_dict)
+        except (ValueError, SyntaxError):
+            pass
+        # Manual fixes
+        text = text.replace("'", '"')
+        text = text.replace("True", "true").replace("False", "false").replace("None", "null")
+        return text
+
     try:
         garment_json = json.loads(json_text)
     except json.JSONDecodeError:
         logger.warning("First JSON parse failed, retrying with cleanup...")
-        # Retry: find first { and last }
-        start = json_text.find("{")
-        end = json_text.rfind("}") + 1
-        if start >= 0 and end > start:
-            garment_json = json.loads(json_text[start:end])
-        else:
-            raise ValueError(f"Could not parse GarmentCode JSON from model output: {json_text[:500]}")
+        cleaned = _clean_json_text(json_text)
+        try:
+            garment_json = json.loads(cleaned)
+        except json.JSONDecodeError:
+            start = cleaned.find("{")
+            end = cleaned.rfind("}") + 1
+            if start >= 0 and end > start:
+                try:
+                    garment_json = json.loads(cleaned[start:end])
+                except json.JSONDecodeError:
+                    raise ValueError(f"Could not parse GarmentCode JSON from model output: {json_text[:500]}")
+            else:
+                raise ValueError(f"Could not parse GarmentCode JSON from model output: {json_text[:500]}")
 
     return description, garment_json
 
