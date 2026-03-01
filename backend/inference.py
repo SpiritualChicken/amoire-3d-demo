@@ -74,7 +74,7 @@ async def mock_generate_3d_garment(image_path: Path, job_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def load_model():
-    """Load LLaVA base model + ChatGarment LoRA weights into GPU memory.
+    """Load ChatGarment GarmentGPTFloat50 model into GPU memory.
 
     Call once at server startup. Keeps model resident for fast inference.
     """
@@ -127,10 +127,10 @@ def load_model():
 
 
 def _run_vlm_inference(image_path: Path) -> tuple[str, dict]:
-    """Two-step Chain-of-Thought inference.
+    """Two-step Chain-of-Thought inference using ChatGarment prompts.
 
-    Step 1: Image → text description of garment(s)
-    Step 2: Image + description → GarmentCode JSON
+    Step 1: Image → JSON geometry description
+    Step 2: Image + description → sewing pattern code
 
     Returns (description_text, garmentcode_json_dict).
     """
@@ -150,12 +150,12 @@ def _run_vlm_inference(image_path: Path) -> tuple[str, dict]:
     else:
         image_tensor = image_tensor.to(DEVICE, dtype=torch.float16)
 
-    # Step 1: Generate text description
+    # Step 1: Generate JSON geometry description (ChatGarment prompt)
     conv = conv_templates["v1"].copy()
     prompt_step1 = (
         f"{DEFAULT_IMAGE_TOKEN}\n"
-        "Describe the garment(s) in this image in detail, including type, "
-        "shape, length, fit, neckline, sleeves, and any distinctive features."
+        "Can you describe the geometry features of the garments "
+        "worn by the model in the Json format?"
     )
     conv.append_message(conv.roles[0], prompt_step1)
     conv.append_message(conv.roles[1], None)
@@ -164,25 +164,47 @@ def _run_vlm_inference(image_path: Path) -> tuple[str, dict]:
         conv.get_prompt(), _tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"
     ).unsqueeze(0).to(DEVICE)
 
-    with torch.inference_mode():
-        output_ids = _model.generate(
-            input_ids,
-            images=image_tensor,
-            do_sample=False,
-            max_new_tokens=512,
-            use_cache=True,
-        )
+    # Use evaluate() if available (GarmentGPTFloat50), else generate()
+    has_evaluate = hasattr(_model, "evaluate")
 
-    description = _tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
-    logger.info(f"Step 1 description: {description[:200]}...")
+    if has_evaluate:
+        logger.info("Using GarmentGPTFloat50 evaluate() method")
+        with torch.no_grad():
+            output_ids, _, _ = _model.evaluate(
+                image_tensor, image_tensor, input_ids,
+                max_new_tokens=2048, tokenizer=_tokenizer,
+            )
+        description = _tokenizer.decode(
+            output_ids[0], skip_special_tokens=True
+        ).strip()
+    else:
+        logger.info("Using standard generate() method")
+        with torch.inference_mode():
+            output_ids = _model.generate(
+                input_ids,
+                images=image_tensor,
+                do_sample=False,
+                max_new_tokens=2048,
+                use_cache=True,
+            )
+        description = _tokenizer.batch_decode(
+            output_ids, skip_special_tokens=True
+        )[0].strip()
 
-    # Step 2: Generate GarmentCode JSON
+    # Clean special tokens from output
+    for token in ["[STARTS]", "[SEG]", "[ENDS]"]:
+        description = description.replace(token, "")
+    description = description.strip()
+
+    logger.info(f"Step 1 output: {description[:300]}...")
+
+    # Step 2: Generate sewing pattern code
     conv2 = conv_templates["v1"].copy()
+    step1_for_prompt = description.replace("upper_garment", "upperbody").replace("lower_garment", "lowerbody")
     prompt_step2 = (
         f"{DEFAULT_IMAGE_TOKEN}\n"
-        f"The garment in this image is described as: {description}\n\n"
-        "Based on this image and description, generate the GarmentCode JSON "
-        "specification for this garment. Output ONLY valid JSON."
+        "Can you estimate the sewing pattern code based on the image "
+        f"and Json format garment geometry description?\n{step1_for_prompt}"
     )
     conv2.append_message(conv2.roles[0], prompt_step2)
     conv2.append_message(conv2.roles[1], None)
@@ -191,17 +213,58 @@ def _run_vlm_inference(image_path: Path) -> tuple[str, dict]:
         conv2.get_prompt(), _tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"
     ).unsqueeze(0).to(DEVICE)
 
-    with torch.inference_mode():
-        output_ids2 = _model.generate(
-            input_ids2,
-            images=image_tensor,
-            do_sample=False,
-            max_new_tokens=2048,
-            use_cache=True,
-            repetition_penalty=1.2,
-        )
+    if has_evaluate:
+        with torch.no_grad():
+            output_ids2, float_preds, seg_mask = _model.evaluate(
+                image_tensor, image_tensor, input_ids2,
+                max_new_tokens=2048, tokenizer=_tokenizer,
+            )
+        json_text = _tokenizer.decode(
+            output_ids2[0], skip_special_tokens=True
+        ).strip()
+    else:
+        with torch.inference_mode():
+            output_ids2 = _model.generate(
+                input_ids2,
+                images=image_tensor,
+                do_sample=False,
+                max_new_tokens=2048,
+                use_cache=True,
+                repetition_penalty=1.2,
+            )
+        json_text = _tokenizer.batch_decode(
+            output_ids2, skip_special_tokens=True
+        )[0].strip()
+        float_preds = None
 
-    json_text = _tokenizer.batch_decode(output_ids2, skip_special_tokens=True)[0].strip()
+    # Clean special tokens
+    for token in ["[STARTS]", "[SEG]", "[ENDS]"]:
+        json_text = json_text.replace(token, "")
+    json_text = json_text.strip()
+
+    logger.info(f"Step 2 raw output: {json_text[:500]}...")
+
+    # If we have float predictions, use ChatGarment's parser
+    if float_preds is not None:
+        logger.info("Using float predictions from GarmentGPTFloat50")
+        try:
+            from garmentcode_parser_float50 import run_garmentcode_parser_float50
+            garment_json = run_garmentcode_parser_float50(json_text, float_preds)
+            return description, garment_json
+        except Exception as e:
+            logger.warning(f"Float parser failed: {e}, falling back to text parsing")
+
+    # Parse JSON from text output
+    # Try json_repair first if available
+    try:
+        from json_repair import repair_json
+        garment_json = repair_json(json_text, return_objects=True)
+        if isinstance(garment_json, dict):
+            return description, garment_json
+    except ImportError:
+        pass
+    except Exception:
+        pass
 
     # Extract JSON from response (may have markdown fences)
     if "```json" in json_text:
@@ -209,45 +272,34 @@ def _run_vlm_inference(image_path: Path) -> tuple[str, dict]:
     elif "```" in json_text:
         json_text = json_text.split("```")[1].split("```")[0].strip()
 
-    # Clean up common model output issues before parsing
-    def _truncate_to_valid(text: str) -> str:
-        """Truncate text to last complete JSON object by balancing braces."""
+    def _clean_json_text(text: str) -> str:
+        """Fix Python-style dict output to valid JSON."""
+        import ast
+        import re
+        # Remove duplicate keys from repetition loops
+        text = re.sub(r"((['\"][^'\"]+['\"])\s*:\s*[^,}]+,?\s*)\1+", r"\1", text)
+        # Find balanced braces
         start = text.find("{")
         if start < 0:
             return text
         depth = 0
-        last_valid_end = -1
+        end = -1
         for i in range(start, len(text)):
             if text[i] == "{":
                 depth += 1
             elif text[i] == "}":
                 depth -= 1
                 if depth == 0:
-                    last_valid_end = i + 1
+                    end = i + 1
                     break
-        if last_valid_end > start:
-            return text[start:last_valid_end]
-        return text
-
-    def _remove_duplicate_keys(text: str) -> str:
-        """Remove repeated key-value pairs caused by model repetition loops."""
-        import re
-        # Match repeated key-value patterns
-        text = re.sub(r"((['\"][^'\"]+['\"])\s*:\s*[^,}]+,?\s*)\1+", r"\1", text)
-        return text
-
-    def _clean_json_text(text: str) -> str:
-        """Fix Python-style dict output to valid JSON."""
-        import ast
-        text = _remove_duplicate_keys(text)
-        text = _truncate_to_valid(text)
-        # Try Python literal eval first (handles single quotes, True/False/None)
+        if end > start:
+            text = text[start:end]
+        # Try Python literal eval (handles single quotes, True/False/None)
         try:
             py_dict = ast.literal_eval(text)
             return json.dumps(py_dict)
         except (ValueError, SyntaxError):
             pass
-        # Manual fixes
         text = text.replace("'", '"')
         text = text.replace("True", "true").replace("False", "false").replace("None", "null")
         return text
@@ -260,15 +312,9 @@ def _run_vlm_inference(image_path: Path) -> tuple[str, dict]:
         try:
             garment_json = json.loads(cleaned)
         except json.JSONDecodeError:
-            start = cleaned.find("{")
-            end = cleaned.rfind("}") + 1
-            if start >= 0 and end > start:
-                try:
-                    garment_json = json.loads(cleaned[start:end])
-                except json.JSONDecodeError:
-                    raise ValueError(f"Could not parse GarmentCode JSON from model output: {json_text[:500]}")
-            else:
-                raise ValueError(f"Could not parse GarmentCode JSON from model output: {json_text[:500]}")
+            raise ValueError(
+                f"Could not parse GarmentCode JSON from model output: {json_text[:500]}"
+            )
 
     return description, garment_json
 
