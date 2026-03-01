@@ -162,11 +162,15 @@ def load_model():
         logger.info(f"[SEG] token index: {_seg_token_idx}")
 
         # --- 2. Base model as GarmentGPTFloat50ForCausalLM ---
+        # ignore_mismatched_sizes=True because base model has vocab_size=32000
+        # but config says 32001 (for [SEG] token). The full PEFT checkpoint
+        # loaded in step 5 will overwrite embed_tokens/lm_head with correct weights.
         logger.info(f"Loading GarmentGPTFloat50 from {LLAVA_MODEL_PATH}...")
         model = GarmentGPTFloat50ForCausalLM.from_pretrained(
             str(LLAVA_MODEL_PATH),
             torch_dtype=dtype,
             seg_token_idx=_seg_token_idx,
+            ignore_mismatched_sizes=True,
         )
         model.config.eos_token_id = _tokenizer.eos_token_id
         model.config.bos_token_id = _tokenizer.bos_token_id
