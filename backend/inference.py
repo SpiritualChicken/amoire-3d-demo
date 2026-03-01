@@ -198,6 +198,7 @@ def _run_vlm_inference(image_path: Path) -> tuple[str, dict]:
             do_sample=False,
             max_new_tokens=2048,
             use_cache=True,
+            repetition_penalty=1.2,
         )
 
     json_text = _tokenizer.batch_decode(output_ids2, skip_special_tokens=True)[0].strip()
@@ -209,16 +210,41 @@ def _run_vlm_inference(image_path: Path) -> tuple[str, dict]:
         json_text = json_text.split("```")[1].split("```")[0].strip()
 
     # Clean up common model output issues before parsing
+    def _truncate_to_valid(text: str) -> str:
+        """Truncate text to last complete JSON object by balancing braces."""
+        start = text.find("{")
+        if start < 0:
+            return text
+        depth = 0
+        last_valid_end = -1
+        for i in range(start, len(text)):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    last_valid_end = i + 1
+                    break
+        if last_valid_end > start:
+            return text[start:last_valid_end]
+        return text
+
+    def _remove_duplicate_keys(text: str) -> str:
+        """Remove repeated key-value pairs caused by model repetition loops."""
+        import re
+        # Match repeated key-value patterns
+        text = re.sub(r"((['\"][^'\"]+['\"])\s*:\s*[^,}]+,?\s*)\1+", r"\1", text)
+        return text
+
     def _clean_json_text(text: str) -> str:
         """Fix Python-style dict output to valid JSON."""
         import ast
+        text = _remove_duplicate_keys(text)
+        text = _truncate_to_valid(text)
         # Try Python literal eval first (handles single quotes, True/False/None)
         try:
-            start = text.find("{")
-            end = text.rfind("}") + 1
-            if start >= 0 and end > start:
-                py_dict = ast.literal_eval(text[start:end])
-                return json.dumps(py_dict)
+            py_dict = ast.literal_eval(text)
+            return json.dumps(py_dict)
         except (ValueError, SyntaxError):
             pass
         # Manual fixes
