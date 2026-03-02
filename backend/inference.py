@@ -520,6 +520,10 @@ def _run_warp_simulation(spec_files: list[Path], output_dir: Path) -> Path:
     import numpy as np
     import trimesh
 
+    # pygarment.meshgen.simulation imports pyrender which needs OpenGL.
+    # On headless servers, use OSMesa for off-screen rendering.
+    os.environ.setdefault("PYOPENGL_PLATFORM", "osmesa")
+
     for p in [str(GARMENTCODE_DIR), str(CHATGARMENT_DIR)]:
         if p not in sys.path:
             sys.path.insert(0, p)
@@ -532,62 +536,69 @@ def _run_warp_simulation(spec_files: list[Path], output_dir: Path) -> Path:
     sim_config_path = str(GARMENTCODE_DIR / "assets" / "Sim_props" / "default_sim_props.yaml")
     system_json_path = str(GARMENTCODE_DIR / "system.json")
 
+    # Must chdir to GarmentCodeRC — system.json uses relative paths like
+    # "./assets/bodies" that resolve from GarmentCodeRC root
+    old_cwd = os.getcwd()
+    os.chdir(str(GARMENTCODE_DIR))
+
     draped_meshes = []
-    for spec_file in spec_files:
-        # Parse garment name: "valid_garment_upper_specification" → "valid_garment_upper"
-        garment_name, _, _ = spec_file.stem.rpartition("_")
-        logger.info(f"Running Warp simulation for {garment_name}...")
+    try:
+        for spec_file in spec_files:
+            # Parse garment name: "valid_garment_upper_specification" → "valid_garment_upper"
+            garment_name, _, _ = spec_file.stem.rpartition("_")
+            logger.info(f"Running Warp simulation for {garment_name}...")
 
-        # Load sim properties fresh for each garment
-        props = data_config.Properties(sim_config_path)
-        props.set_section_stats(
-            "sim", fails={}, sim_time={}, spf={},
-            fin_frame={}, body_collisions={}, self_collisions={},
-        )
-        props.set_section_stats("render", render_time={})
+            # Load sim properties fresh for each garment
+            props = data_config.Properties(sim_config_path)
+            props.set_section_stats(
+                "sim", fails={}, sim_time={}, spf={},
+                fin_frame={}, body_collisions={}, self_collisions={},
+            )
+            props.set_section_stats("render", render_time={})
 
-        # Configure paths — use absolute system.json path to avoid CWD issues
-        paths = PathCofig(
-            in_element_path=spec_file.parent,
-            out_path=str(output_dir),
-            in_name=garment_name,
-            body_name="mean_all",
-            smpl_body=False,
-            add_timestamp=False,
-            system_path=system_json_path,
-        )
+            paths = PathCofig(
+                in_element_path=spec_file.parent,
+                out_path=str(output_dir),
+                in_name=garment_name,
+                body_name="mean_all",
+                smpl_body=False,
+                add_timestamp=False,
+                system_path=system_json_path,
+            )
 
-        # Generate box mesh and serialize (creates _boxmesh.obj, segmentation,
-        # edge lengths, vertex labels needed by the simulator)
-        resolution = props["sim"]["config"]["resolution_scale"]
-        garment_box_mesh = BoxMesh(paths.in_g_spec, resolution)
-        garment_box_mesh.load()
-        garment_box_mesh.serialize(
-            paths, store_panels=False,
-            uv_config=props["render"]["config"]["uv_texture"],
-        )
-        props.serialize(paths.element_sim_props)
+            # Generate box mesh and serialize (creates _boxmesh.obj, segmentation,
+            # edge lengths, vertex labels needed by the simulator)
+            resolution = props["sim"]["config"]["resolution_scale"]
+            garment_box_mesh = BoxMesh(paths.in_g_spec, resolution)
+            garment_box_mesh.load()
+            garment_box_mesh.serialize(
+                paths, store_panels=False,
+                uv_config=props["render"]["config"]["uv_texture"],
+            )
+            props.serialize(paths.element_sim_props)
 
-        # Run FEM cloth simulation (drapes panels onto body)
-        run_sim(
-            garment_box_mesh.name,
-            props,
-            paths,
-            save_v_norms=False,
-            store_usd=False,
-            optimize_storage=False,
-            verbose=False,
-        )
-        props.serialize(paths.element_sim_props)
+            # Run FEM cloth simulation (drapes panels onto body)
+            run_sim(
+                garment_box_mesh.name,
+                props,
+                paths,
+                save_v_norms=False,
+                store_usd=False,
+                optimize_storage=False,
+                verbose=False,
+            )
+            props.serialize(paths.element_sim_props)
 
-        # Load the draped result
-        sim_obj_path = Path(paths.g_sim)
-        if sim_obj_path.exists():
-            logger.info(f"  Simulation complete: {sim_obj_path}")
-            mesh = trimesh.load(str(sim_obj_path), process=False)
-            draped_meshes.append(mesh)
-        else:
-            logger.warning(f"  Simulation output not found at {sim_obj_path}")
+            # Load the draped result
+            sim_obj_path = Path(paths.g_sim)
+            if sim_obj_path.exists():
+                logger.info(f"  Simulation complete: {sim_obj_path}")
+                mesh = trimesh.load(str(sim_obj_path), process=False)
+                draped_meshes.append(mesh)
+            else:
+                logger.warning(f"  Simulation output not found at {sim_obj_path}")
+    finally:
+        os.chdir(old_cwd)
 
     if not draped_meshes:
         raise RuntimeError("Warp simulation produced no output meshes")
