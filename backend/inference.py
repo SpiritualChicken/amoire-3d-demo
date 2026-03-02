@@ -31,6 +31,7 @@ from typing import Optional
 from config import (
     CHATGARMENT_DIR,
     CONTOURCRAFT_DIR,
+    CONTOURCRAFT_ENABLED,
     DEVICE,
     GARMENTCODE_DIR,
     LLAVA_MODEL_PATH,
@@ -501,6 +502,32 @@ def _run_contourcraft_draping(pattern_dir: Path, output_dir: Path) -> Path:
     return obj_path
 
 
+def _detect_garment_type(garment_json: dict) -> str:
+    """Detect garment type from the GarmentCode JSON output."""
+    if "upperbody_garment" in garment_json and "lowerbody_garment" in garment_json:
+        return "outfit"
+    if "upperbody_garment" in garment_json:
+        return "top"
+    if "lowerbody_garment" in garment_json:
+        return "bottom"
+    if "wholebody_garment" in garment_json:
+        return "dress"
+    return garment_json.get("type", garment_json.get("garment_type", "unknown"))
+
+
+def _garment_type_to_shape(garment_type: str) -> str:
+    """Map detected garment type to placeholder shape name."""
+    mapping = {
+        "outfit": "tshirt",
+        "top": "tshirt",
+        "bottom": "pants",
+        "dress": "dress",
+        "skirt": "skirt",
+        "pants": "pants",
+    }
+    return mapping.get(garment_type, "tshirt")
+
+
 async def generate_3d_garment(
     image_path: Path,
     job_id: str,
@@ -573,9 +600,12 @@ async def generate_3d_garment(
         except Exception as e:
             logger.warning(f"[{job_id}] Sewing pattern generation failed: {e}")
 
-    # Step 5: 3D draping simulation
+    # Detect garment type from JSON (used for placeholder fallback)
+    garment_type = _detect_garment_type(garment_json)
+
+    # Step 5: 3D draping simulation (requires ContourCraft)
     obj_path = None
-    if pattern_dir:
+    if pattern_dir and CONTOURCRAFT_ENABLED:
         if progress_callback:
             await progress_callback("draping", 70)
         logger.info(f"[{job_id}] Running 3D draping simulation...")
@@ -585,6 +615,11 @@ async def generate_3d_garment(
             )
         except Exception as e:
             logger.warning(f"[{job_id}] 3D draping failed: {e}")
+    elif pattern_dir:
+        logger.info(
+            f"[{job_id}] ContourCraft disabled — skipping 3D draping. "
+            "Set CONTOURCRAFT_ENABLED=true to enable."
+        )
 
     # Step 6: Convert to GLB
     glb_path = output_dir / "garment.glb"
@@ -600,23 +635,29 @@ async def generate_3d_garment(
             logger.warning(f"[{job_id}] GLB conversion failed: {e}")
             glb_path = None
     else:
-        # Downstream pipeline not available — create a placeholder mesh
-        logger.info(f"[{job_id}] Creating placeholder mesh (downstream pipeline not ready)")
-        create_placeholder_glb(glb_path, shape="tshirt")
+        # No draped mesh — try to build from sewing patterns, else placeholder
+        if progress_callback:
+            await progress_callback("building_mesh", 85)
+        if pattern_dir:
+            logger.info(f"[{job_id}] Building mesh from sewing pattern panels...")
+            try:
+                from mesh_utils import build_mesh_from_panels
+                built = await asyncio.to_thread(
+                    build_mesh_from_panels, pattern_dir, glb_path, garment_type
+                )
+                if built:
+                    logger.info(f"[{job_id}] Panel mesh created successfully")
+                else:
+                    raise RuntimeError("build_mesh_from_panels returned False")
+            except Exception as e:
+                logger.warning(f"[{job_id}] Panel mesh failed ({e}), using placeholder")
+                create_placeholder_glb(glb_path, shape=_garment_type_to_shape(garment_type))
+        else:
+            logger.info(f"[{job_id}] No sewing patterns — using placeholder mesh")
+            create_placeholder_glb(glb_path, shape=_garment_type_to_shape(garment_type))
 
     processing_time = time.time() - start_time
     logger.info(f"[{job_id}] Complete in {processing_time:.1f}s")
-
-    # Detect garment type from JSON
-    garment_type = "unknown"
-    if "upperbody_garment" in garment_json:
-        garment_type = "outfit"
-    elif "wholebody_garment" in garment_json:
-        garment_type = "dress"
-    else:
-        garment_type = garment_json.get(
-            "type", garment_json.get("garment_type", "unknown")
-        )
 
     svg_path = None
     if pattern_dir and (pattern_dir / "pattern.svg").exists():

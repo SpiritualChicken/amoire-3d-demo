@@ -93,6 +93,175 @@ def cache_result(image_hash: str, mesh_path: Path, metadata: dict) -> Path:
     return cached_glb
 
 
+def build_mesh_from_panels(
+    pattern_dir: Path, output_path: Path, garment_type: str = "unknown"
+) -> bool:
+    """Build a 3D mesh from GarmentCodeRC sewing pattern SVG panels.
+
+    Parses panel outlines from SVGs, triangulates them as flat 3D surfaces,
+    and arranges them in 3D space based on garment type. This produces a
+    "flat layout" style visualization — not a draped garment, but shows
+    the actual pattern shapes rather than generic placeholders.
+
+    Returns True on success, False if no usable pattern data found.
+    """
+    import logging
+    import xml.etree.ElementTree as ET
+
+    import numpy as np
+
+    logger = logging.getLogger(__name__)
+
+    # Find all pattern SVGs in the output directory
+    svg_files = list(pattern_dir.rglob("*_pattern.svg"))
+    if not svg_files:
+        svg_files = list(pattern_dir.rglob("*.svg"))
+    if not svg_files:
+        logger.warning(f"No SVG files found in {pattern_dir}")
+        return False
+
+    all_meshes = []
+    y_offset = 0.0
+
+    for svg_file in svg_files:
+        try:
+            panels = _extract_svg_panels(svg_file)
+            if not panels:
+                continue
+
+            for panel_verts in panels:
+                if len(panel_verts) < 3:
+                    continue
+
+                # Create a flat 2D mesh from panel outline
+                verts_2d = np.array(panel_verts, dtype=np.float64)
+
+                # Scale from SVG units (typically mm/pixels) to meters
+                # GarmentCodeRC patterns are usually in cm, scale to ~0.5m display size
+                verts_2d = verts_2d / 100.0
+
+                # Center the panel
+                center = verts_2d.mean(axis=0)
+                verts_2d -= center
+
+                # Create 3D vertices (panels laid flat in XY plane, offset along Y)
+                verts_3d = np.zeros((len(verts_2d), 3))
+                verts_3d[:, 0] = verts_2d[:, 0]  # X
+                verts_3d[:, 1] = y_offset          # Y (stack panels vertically)
+                verts_3d[:, 2] = verts_2d[:, 1]    # Z (SVG Y → world Z)
+
+                # Triangulate using fan triangulation from centroid
+                centroid = verts_3d.mean(axis=0)
+                n = len(verts_3d)
+                all_verts = list(verts_3d) + [centroid]
+                center_idx = n
+                faces = []
+                for i in range(n):
+                    faces.append([i, (i + 1) % n, center_idx])
+
+                panel_mesh = trimesh.Trimesh(
+                    vertices=np.array(all_verts),
+                    faces=np.array(faces),
+                )
+                all_meshes.append(panel_mesh)
+
+                # Offset next panel
+                bounds = verts_2d.max(axis=0) - verts_2d.min(axis=0)
+                y_offset += max(bounds) + 0.05
+
+        except Exception as e:
+            logger.warning(f"Failed to parse SVG {svg_file}: {e}")
+            continue
+
+    if not all_meshes:
+        return False
+
+    # Combine all panels into one mesh
+    combined = trimesh.util.concatenate(all_meshes)
+
+    # Center the whole thing
+    combined.apply_translation(-combined.centroid)
+
+    # Scale to reasonable display size (~0.5m tall)
+    extent = combined.extents.max()
+    if extent > 0:
+        combined.apply_scale(0.5 / extent)
+
+    # Apply fabric-like color
+    combined.visual = trimesh.visual.ColorVisuals(
+        mesh=combined,
+        vertex_colors=np.tile([220, 218, 213, 255], (len(combined.vertices), 1)),
+    )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    combined.export(str(output_path), file_type="glb")
+    return True
+
+
+def _extract_svg_panels(svg_path: Path) -> list[list[tuple[float, float]]]:
+    """Extract polygon outlines from an SVG file.
+
+    Handles <polygon>, <polyline>, and simple <path> elements.
+    Returns list of panels, each a list of (x, y) vertices.
+    """
+    import re
+    import xml.etree.ElementTree as ET
+
+    tree = ET.parse(str(svg_path))
+    root = tree.getroot()
+
+    # Handle SVG namespace
+    ns = ""
+    if root.tag.startswith("{"):
+        ns = root.tag.split("}")[0] + "}"
+
+    panels = []
+
+    # Extract <polygon> elements
+    for poly in root.iter(f"{ns}polygon"):
+        points_str = poly.get("points", "")
+        verts = _parse_svg_points(points_str)
+        if len(verts) >= 3:
+            panels.append(verts)
+
+    # Extract <polyline> elements
+    for poly in root.iter(f"{ns}polyline"):
+        points_str = poly.get("points", "")
+        verts = _parse_svg_points(points_str)
+        if len(verts) >= 3:
+            panels.append(verts)
+
+    # Extract <path> elements with simple M/L/Z commands
+    for path_el in root.iter(f"{ns}path"):
+        d = path_el.get("d", "")
+        verts = _parse_svg_path_simple(d)
+        if len(verts) >= 3:
+            panels.append(verts)
+
+    return panels
+
+
+def _parse_svg_points(points_str: str) -> list[tuple[float, float]]:
+    """Parse SVG points attribute: '100,200 300,400 ...'"""
+    import re
+
+    verts = []
+    for match in re.finditer(r"([-\d.]+)[,\s]+([-\d.]+)", points_str):
+        verts.append((float(match.group(1)), float(match.group(2))))
+    return verts
+
+
+def _parse_svg_path_simple(d: str) -> list[tuple[float, float]]:
+    """Parse simple SVG path (M/L/Z commands only) into vertices."""
+    import re
+
+    verts = []
+    # Match M/L followed by coordinates
+    for match in re.finditer(r"[ML]\s*([-\d.]+)[,\s]+([-\d.]+)", d, re.IGNORECASE):
+        verts.append((float(match.group(1)), float(match.group(2))))
+    return verts
+
+
 def create_placeholder_glb(output_path: Path, shape: str = "tshirt") -> Path:
     """Generate a simple geometric placeholder .glb for demo/mock mode.
 

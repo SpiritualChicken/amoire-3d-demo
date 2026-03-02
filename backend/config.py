@@ -43,6 +43,10 @@ DEVICE = os.getenv("DEVICE", "cuda")
 # Mock mode — skip ML inference, return placeholder meshes
 MOCK_MODE = os.getenv("MOCK_MODE", "false").lower() == "true"
 
+# ContourCraft 3D draping — disabled by default until fully set up
+# Set CONTOURCRAFT_ENABLED=true to enable physics-based draping via ContourCraft-CG
+CONTOURCRAFT_ENABLED = os.getenv("CONTOURCRAFT_ENABLED", "false").lower() == "true"
+
 # Ensure data directories exist
 for d in [UPLOAD_DIR, OUTPUT_DIR, CACHE_DIR]:
     d.mkdir(parents=True, exist_ok=True)
