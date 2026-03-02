@@ -21,6 +21,7 @@ For mock mode, this returns placeholder meshes without any ML dependencies.
 import asyncio
 import json
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -422,9 +423,16 @@ def _run_garmentcode_parser(
     sys.path.insert(0, str(CHATGARMENT_DIR))
     from llava.garment_utils_v2 import run_garmentcode_parser_float50
 
-    spec_files = run_garmentcode_parser_float50(
-        [], garment_json, float_preds, str(output_dir)
-    )
+    # garment_utils_v2 loads docs/all_float_paths.json with a relative path,
+    # so we must run from the ChatGarment directory
+    old_cwd = os.getcwd()
+    os.chdir(str(CHATGARMENT_DIR))
+    try:
+        spec_files = run_garmentcode_parser_float50(
+            [], garment_json, float_preds, str(output_dir)
+        )
+    finally:
+        os.chdir(old_cwd)
     return [Path(f) for f in spec_files]
 
 
