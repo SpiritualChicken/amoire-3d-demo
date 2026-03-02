@@ -7,7 +7,7 @@ Wraps ChatGarment's GarmentGPTFloat50 model into a clean async interface.
 This is the ONLY file that needs to change when swapping ML models.
 
 Pipeline: Image → GarmentGPTFloat50 (2-step CoT) → GarmentCode JSON + Float Predictions
-          → Sewing Pattern Spec Files → (GarmentCodeRC → ContourCraft → 3D Mesh)
+          → Sewing Pattern Spec Files → BoxMesh → Warp Simulation (draping) → 3D Mesh
 
 The model loading follows ChatGarment's own inference procedure:
   1. Load base LLaVA model as GarmentGPTFloat50ForCausalLM
@@ -30,9 +30,8 @@ from typing import Optional
 
 from config import (
     CHATGARMENT_DIR,
-    CONTOURCRAFT_DIR,
-    CONTOURCRAFT_ENABLED,
     DEVICE,
+    DRAPING_ENABLED,
     GARMENTCODE_DIR,
     LLAVA_MODEL_PATH,
     LORA_WEIGHTS_PATH,
@@ -308,9 +307,9 @@ def _run_vlm_inference(image_path: Path) -> tuple[str, dict, object]:
     # ---- Step 2: Sewing pattern code + float predictions ----
     conv2 = conv_templates["v1"].copy()
     desc_for_prompt = description.replace(
-        "upper_garment", "upperbody"
+        "upper_garment", "upperbody_garment"
     ).replace(
-        "lower_garment", "lowerbody"
+        "lower_garment", "lowerbody_garment"
     )
     conv2.append_message(conv2.roles[0], (
         f"{DEFAULT_IMAGE_TOKEN}\n"
@@ -506,31 +505,111 @@ def _generate_garment_mesh(spec_files: list[Path], output_dir: Path) -> Path:
     return obj_path
 
 
-def _run_contourcraft_draping(pattern_dir: Path, output_dir: Path) -> Path:
-    """Run ContourCraft-CG to drape sewing patterns onto a body mesh.
+def _run_warp_simulation(spec_files: list[Path], output_dir: Path) -> Path:
+    """Run Warp physics simulation to drape garment panels onto a body mesh.
 
-    Returns path to the output OBJ mesh.
+    Uses GarmentCodeRC's built-in FEM cloth simulation (NVIDIA Warp) to drape
+    flat sewing panels onto a neutral body model. This produces realistic 3D
+    garment shapes instead of flat spread-out panels.
+
+    For each spec file: BoxMesh.load() → BoxMesh.serialize() → run_sim()
+    The simulation output is a draped OBJ mesh at {garment_name}_sim.obj.
+
+    Returns path to the combined output OBJ file.
     """
-    obj_path = output_dir / "garment.obj"
+    import numpy as np
+    import trimesh
 
-    import subprocess
+    for p in [str(GARMENTCODE_DIR), str(CHATGARMENT_DIR)]:
+        if p not in sys.path:
+            sys.path.insert(0, p)
 
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(CONTOURCRAFT_DIR / "drape.py"),
-            "--patterns", str(pattern_dir),
-            "--output", str(obj_path),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=180,
-        cwd=str(CONTOURCRAFT_DIR),
+    from pygarment.meshgen.boxmeshgen import BoxMesh
+    from pygarment.meshgen.simulation import run_sim
+    import pygarment.data_config as data_config
+    from pygarment.meshgen.sim_config import PathCofig
+
+    sim_config_path = str(GARMENTCODE_DIR / "assets" / "Sim_props" / "default_sim_props.yaml")
+    system_json_path = str(GARMENTCODE_DIR / "system.json")
+
+    draped_meshes = []
+    for spec_file in spec_files:
+        # Parse garment name: "valid_garment_upper_specification" → "valid_garment_upper"
+        garment_name, _, _ = spec_file.stem.rpartition("_")
+        logger.info(f"Running Warp simulation for {garment_name}...")
+
+        # Load sim properties fresh for each garment
+        props = data_config.Properties(sim_config_path)
+        props.set_section_stats(
+            "sim", fails={}, sim_time={}, spf={},
+            fin_frame={}, body_collisions={}, self_collisions={},
+        )
+        props.set_section_stats("render", render_time={})
+
+        # Configure paths — use absolute system.json path to avoid CWD issues
+        paths = PathCofig(
+            in_element_path=spec_file.parent,
+            out_path=str(output_dir),
+            in_name=garment_name,
+            body_name="mean_all",
+            smpl_body=False,
+            add_timestamp=False,
+            system_path=system_json_path,
+        )
+
+        # Generate box mesh and serialize (creates _boxmesh.obj, segmentation,
+        # edge lengths, vertex labels needed by the simulator)
+        resolution = props["sim"]["config"]["resolution_scale"]
+        garment_box_mesh = BoxMesh(paths.in_g_spec, resolution)
+        garment_box_mesh.load()
+        garment_box_mesh.serialize(
+            paths, store_panels=False,
+            uv_config=props["render"]["config"]["uv_texture"],
+        )
+        props.serialize(paths.element_sim_props)
+
+        # Run FEM cloth simulation (drapes panels onto body)
+        run_sim(
+            garment_box_mesh.name,
+            props,
+            paths,
+            save_v_norms=False,
+            store_usd=False,
+            optimize_storage=False,
+            verbose=False,
+        )
+        props.serialize(paths.element_sim_props)
+
+        # Load the draped result
+        sim_obj_path = Path(paths.g_sim)
+        if sim_obj_path.exists():
+            logger.info(f"  Simulation complete: {sim_obj_path}")
+            mesh = trimesh.load(str(sim_obj_path), process=False)
+            draped_meshes.append(mesh)
+        else:
+            logger.warning(f"  Simulation output not found at {sim_obj_path}")
+
+    if not draped_meshes:
+        raise RuntimeError("Warp simulation produced no output meshes")
+
+    # Combine all draped garment pieces
+    if len(draped_meshes) > 1:
+        combined = trimesh.util.concatenate(draped_meshes)
+    else:
+        combined = draped_meshes[0]
+
+    # Apply a neutral fabric color
+    combined.visual = trimesh.visual.ColorVisuals(
+        mesh=combined,
+        vertex_colors=np.tile([220, 218, 213, 255], (len(combined.vertices), 1)),
     )
 
-    if result.returncode != 0:
-        logger.error(f"ContourCraft failed: {result.stderr}")
-        raise RuntimeError(f"3D draping simulation failed: {result.stderr[:500]}")
+    obj_path = output_dir / "garment_draped.obj"
+    combined.export(str(obj_path))
+    logger.info(
+        f"Draped garment mesh: {len(combined.vertices)} verts, "
+        f"{len(combined.faces)} faces → {obj_path}"
+    )
 
     return obj_path
 
@@ -623,31 +702,34 @@ async def generate_3d_garment(
     # Detect garment type from JSON (used for placeholder fallback)
     garment_type = _detect_garment_type(garment_json)
 
-    # Step 4: Generate 3D garment mesh from spec files (BoxMesh)
+    # Step 4: Generate 3D garment mesh from spec files
     obj_path = None
-    if spec_files:
+    if spec_files and DRAPING_ENABLED:
+        # Warp simulation: BoxMesh → serialize → physics draping onto body
+        if progress_callback:
+            await progress_callback("simulating", 50)
+        logger.info(f"[{job_id}] Running Warp physics simulation (draping onto body)...")
+        try:
+            obj_path = await asyncio.to_thread(
+                _run_warp_simulation, spec_files, output_dir
+            )
+        except Exception as e:
+            logger.warning(
+                f"[{job_id}] Warp simulation failed, falling back to BoxMesh: {e}",
+                exc_info=True,
+            )
+
+    if spec_files and obj_path is None:
+        # Fallback: flat BoxMesh panels (no draping)
         if progress_callback:
             await progress_callback("generating_mesh", 50)
-        logger.info(f"[{job_id}] Generating 3D garment mesh from specifications...")
+        logger.info(f"[{job_id}] Generating flat BoxMesh (no draping)...")
         try:
             obj_path = await asyncio.to_thread(
                 _generate_garment_mesh, spec_files, output_dir
             )
         except Exception as e:
             logger.warning(f"[{job_id}] Mesh generation failed: {e}", exc_info=True)
-
-    # Step 5: ContourCraft draping (optional, for physics-based draping on body)
-    if obj_path and CONTOURCRAFT_ENABLED:
-        if progress_callback:
-            await progress_callback("draping", 70)
-        logger.info(f"[{job_id}] Running ContourCraft 3D draping...")
-        try:
-            draped_path = await asyncio.to_thread(
-                _run_contourcraft_draping, obj_path.parent, output_dir
-            )
-            obj_path = draped_path
-        except Exception as e:
-            logger.warning(f"[{job_id}] ContourCraft draping failed: {e}")
 
     # Step 6: Convert to GLB
     glb_path = output_dir / "garment.glb"

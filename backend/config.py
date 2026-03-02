@@ -33,7 +33,7 @@ HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
 MAX_UPLOAD_SIZE_MB = 20
 MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
-INFERENCE_TIMEOUT_SECONDS = 300
+INFERENCE_TIMEOUT_SECONDS = 900  # 15 min — simulation draping can take 2-10 min per garment
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
 
 # Inference config
@@ -43,9 +43,13 @@ DEVICE = os.getenv("DEVICE", "cuda")
 # Mock mode — skip ML inference, return placeholder meshes
 MOCK_MODE = os.getenv("MOCK_MODE", "false").lower() == "true"
 
-# ContourCraft 3D draping — disabled by default until fully set up
-# Set CONTOURCRAFT_ENABLED=true to enable physics-based draping via ContourCraft-CG
-CONTOURCRAFT_ENABLED = os.getenv("CONTOURCRAFT_ENABLED", "false").lower() == "true"
+# Physics-based draping — uses NVIDIA Warp FEM simulation to drape flat sewing
+# panels onto a body mesh. Requires NvidiaWarp-GarmentCode and libigl.
+# Set DRAPING_ENABLED=true to enable. Falls back to flat BoxMesh panels if disabled.
+DRAPING_ENABLED = (
+    os.getenv("DRAPING_ENABLED", "false").lower() == "true"
+    or os.getenv("CONTOURCRAFT_ENABLED", "false").lower() == "true"  # backward compat
+)
 
 # Ensure data directories exist
 for d in [UPLOAD_DIR, OUTPUT_DIR, CACHE_DIR]:
