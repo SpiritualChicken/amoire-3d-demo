@@ -421,7 +421,10 @@ def _run_garmentcode_parser(
 
     Returns list of paths to generated specification JSON files.
     """
-    sys.path.insert(0, str(CHATGARMENT_DIR))
+    # Ensure both ChatGarment and GarmentCodeRC (pygarment) are on sys.path
+    for p in [str(CHATGARMENT_DIR), str(GARMENTCODE_DIR)]:
+        if p not in sys.path:
+            sys.path.insert(0, p)
 
     # Must chdir BEFORE import — garment_utils_v2 loads docs/all_float_paths.json
     # at module level with a relative path
@@ -585,7 +588,7 @@ async def generate_3d_garment(
             )
             logger.info(f"[{job_id}] Generated {len(spec_files)} spec files")
         except Exception as e:
-            logger.warning(f"[{job_id}] GarmentCode parser failed: {e}")
+            logger.warning(f"[{job_id}] GarmentCode parser failed: {e}", exc_info=True)
 
     # Step 4: Generate sewing patterns from spec files
     pattern_dir = None
