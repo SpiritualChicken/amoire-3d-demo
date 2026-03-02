@@ -441,39 +441,69 @@ def _run_garmentcode_parser(
     return [Path(f) for f in spec_files]
 
 
-def _run_garmentcode_simulation(spec_files: list[Path], output_dir: Path) -> Path:
-    """Run GarmentCodeRC to generate 2D sewing patterns from spec files.
+def _generate_garment_mesh(spec_files: list[Path], output_dir: Path) -> Path:
+    """Generate 3D garment mesh from specification files using GarmentCodeRC BoxMesh.
 
-    Returns path to the sewing pattern data directory.
+    Creates a triangulated 3D mesh from sewing pattern specifications.
+    Each garment piece (upper, lower) is loaded as a BoxMesh with proper
+    3D panel positioning, then combined into a single OBJ mesh.
+
+    Returns path to the output OBJ file.
     """
-    sys.path.insert(0, str(GARMENTCODE_DIR))
+    import numpy as np
+    import trimesh
 
-    pattern_dir = output_dir / "sewing_patterns"
-    pattern_dir.mkdir(exist_ok=True)
+    for p in [str(GARMENTCODE_DIR)]:
+        if p not in sys.path:
+            sys.path.insert(0, p)
 
-    import subprocess
+    from pygarment.meshgen.boxmeshgen import BoxMesh
+    import pygarment.data_config as data_config
 
+    props = data_config.Properties(
+        str(GARMENTCODE_DIR / "assets" / "Sim_props" / "default_sim_props.yaml")
+    )
+    resolution = props["sim"]["config"]["resolution_scale"]
+
+    all_meshes = []
     for spec_file in spec_files:
-        result = subprocess.run(
-            [
-                sys.executable,
-                str(GARMENTCODE_DIR / "test_garmentcode.py"),
-                "--config", str(spec_file),
-                "--output", str(pattern_dir),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            cwd=str(GARMENTCODE_DIR),
+        logger.info(f"Generating BoxMesh from {spec_file.name}...")
+        bm = BoxMesh(str(spec_file), resolution)
+        bm.load()
+
+        mesh = trimesh.Trimesh(
+            vertices=np.array(bm.vertices),
+            faces=np.array(bm.faces),
         )
+        logger.info(
+            f"  {spec_file.stem}: {len(mesh.vertices)} verts, "
+            f"{len(mesh.faces)} faces, {len(bm.panels)} panels"
+        )
+        all_meshes.append(mesh)
 
-        if result.returncode != 0:
-            logger.error(f"GarmentCodeRC failed for {spec_file}: {result.stderr}")
-            raise RuntimeError(
-                f"Sewing pattern generation failed: {result.stderr[:500]}"
-            )
+    if not all_meshes:
+        raise RuntimeError("No meshes generated from spec files")
 
-    return pattern_dir
+    # Combine all garment pieces into one mesh
+    if len(all_meshes) > 1:
+        combined = trimesh.util.concatenate(all_meshes)
+    else:
+        combined = all_meshes[0]
+
+    # Apply a neutral fabric color
+    combined.visual = trimesh.visual.ColorVisuals(
+        mesh=combined,
+        vertex_colors=np.tile([220, 218, 213, 255], (len(combined.vertices), 1)),
+    )
+
+    obj_path = output_dir / "garment.obj"
+    combined.export(str(obj_path))
+    logger.info(
+        f"Combined garment mesh: {len(combined.vertices)} verts, "
+        f"{len(combined.faces)} faces → {obj_path}"
+    )
+
+    return obj_path
 
 
 def _run_contourcraft_draping(pattern_dir: Path, output_dir: Path) -> Path:
@@ -590,39 +620,34 @@ async def generate_3d_garment(
         except Exception as e:
             logger.warning(f"[{job_id}] GarmentCode parser failed: {e}", exc_info=True)
 
-    # Step 4: Generate sewing patterns from spec files
-    pattern_dir = None
-    if spec_files:
-        if progress_callback:
-            await progress_callback("sewing_patterns", 50)
-        logger.info(f"[{job_id}] Generating sewing patterns...")
-        try:
-            pattern_dir = await asyncio.to_thread(
-                _run_garmentcode_simulation, spec_files, output_dir
-            )
-        except Exception as e:
-            logger.warning(f"[{job_id}] Sewing pattern generation failed: {e}")
-
     # Detect garment type from JSON (used for placeholder fallback)
     garment_type = _detect_garment_type(garment_json)
 
-    # Step 5: 3D draping simulation (requires ContourCraft)
+    # Step 4: Generate 3D garment mesh from spec files (BoxMesh)
     obj_path = None
-    if pattern_dir and CONTOURCRAFT_ENABLED:
+    if spec_files:
         if progress_callback:
-            await progress_callback("draping", 70)
-        logger.info(f"[{job_id}] Running 3D draping simulation...")
+            await progress_callback("generating_mesh", 50)
+        logger.info(f"[{job_id}] Generating 3D garment mesh from specifications...")
         try:
             obj_path = await asyncio.to_thread(
-                _run_contourcraft_draping, pattern_dir, output_dir
+                _generate_garment_mesh, spec_files, output_dir
             )
         except Exception as e:
-            logger.warning(f"[{job_id}] 3D draping failed: {e}")
-    elif pattern_dir:
-        logger.info(
-            f"[{job_id}] ContourCraft disabled — skipping 3D draping. "
-            "Set CONTOURCRAFT_ENABLED=true to enable."
-        )
+            logger.warning(f"[{job_id}] Mesh generation failed: {e}", exc_info=True)
+
+    # Step 5: ContourCraft draping (optional, for physics-based draping on body)
+    if obj_path and CONTOURCRAFT_ENABLED:
+        if progress_callback:
+            await progress_callback("draping", 70)
+        logger.info(f"[{job_id}] Running ContourCraft 3D draping...")
+        try:
+            draped_path = await asyncio.to_thread(
+                _run_contourcraft_draping, obj_path.parent, output_dir
+            )
+            obj_path = draped_path
+        except Exception as e:
+            logger.warning(f"[{job_id}] ContourCraft draping failed: {e}")
 
     # Step 6: Convert to GLB
     glb_path = output_dir / "garment.glb"
@@ -631,46 +656,22 @@ async def generate_3d_garment(
             await progress_callback("converting", 90)
         logger.info(f"[{job_id}] Converting mesh to GLB...")
         try:
-            from mesh_utils import obj_to_glb, simplify_mesh
-            simplified = await asyncio.to_thread(simplify_mesh, obj_path)
-            await asyncio.to_thread(obj_to_glb, simplified, glb_path)
+            from mesh_utils import obj_to_glb
+            await asyncio.to_thread(obj_to_glb, obj_path, glb_path)
         except Exception as e:
             logger.warning(f"[{job_id}] GLB conversion failed: {e}")
-            glb_path = None
-    else:
-        # No draped mesh — try to build from sewing patterns, else placeholder
-        if progress_callback:
-            await progress_callback("building_mesh", 85)
-        if pattern_dir:
-            logger.info(f"[{job_id}] Building mesh from sewing pattern panels...")
-            try:
-                from mesh_utils import build_mesh_from_panels
-                # SVGs are in output_dir (valid_garment_upper/ etc), not pattern_dir
-                built = await asyncio.to_thread(
-                    build_mesh_from_panels, output_dir, glb_path, garment_type
-                )
-                if built:
-                    logger.info(f"[{job_id}] Panel mesh created successfully")
-                else:
-                    raise RuntimeError("build_mesh_from_panels returned False")
-            except Exception as e:
-                logger.warning(f"[{job_id}] Panel mesh failed ({e}), using placeholder")
-                create_placeholder_glb(glb_path, shape=_garment_type_to_shape(garment_type))
-        else:
-            logger.info(f"[{job_id}] No sewing patterns — using placeholder mesh")
             create_placeholder_glb(glb_path, shape=_garment_type_to_shape(garment_type))
+    else:
+        logger.info(f"[{job_id}] No mesh generated — using placeholder")
+        create_placeholder_glb(glb_path, shape=_garment_type_to_shape(garment_type))
 
     processing_time = time.time() - start_time
     logger.info(f"[{job_id}] Complete in {processing_time:.1f}s")
 
     svg_path = None
-    # Look for SVGs in both sewing_patterns/ and output_dir/
-    for search_dir in [pattern_dir, output_dir]:
-        if search_dir:
-            svgs = list(search_dir.rglob("*_pattern.svg"))
-            if svgs:
-                svg_path = svgs[0]
-                break
+    svgs = list(output_dir.rglob("*_pattern.svg"))
+    if svgs:
+        svg_path = svgs[0]
 
     return {
         "mesh_path": glb_path,
