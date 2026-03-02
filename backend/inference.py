@@ -421,13 +421,14 @@ def _run_garmentcode_parser(
     Returns list of paths to generated specification JSON files.
     """
     sys.path.insert(0, str(CHATGARMENT_DIR))
-    from llava.garment_utils_v2 import run_garmentcode_parser_float50
 
-    # garment_utils_v2 loads docs/all_float_paths.json with a relative path,
-    # so we must run from the ChatGarment directory
+    # Must chdir BEFORE import — garment_utils_v2 loads docs/all_float_paths.json
+    # at module level with a relative path
     old_cwd = os.getcwd()
     os.chdir(str(CHATGARMENT_DIR))
     try:
+        from llava.garment_utils_v2 import run_garmentcode_parser_float50
+
         spec_files = run_garmentcode_parser_float50(
             [], garment_json, float_preds, str(output_dir)
         )
