@@ -573,7 +573,7 @@ def _run_warp_simulation(spec_files: list[Path], output_dir: Path) -> Path:
             garment_box_mesh.load()
             garment_box_mesh.serialize(
                 paths, store_panels=False,
-                uv_config=props["render"]["config"]["uv_texture"],
+                uv_config=None,  # Skip UV unwrapping — not needed for simulation
             )
             props.serialize(paths.element_sim_props)
 
