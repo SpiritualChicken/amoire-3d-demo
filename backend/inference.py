@@ -642,8 +642,9 @@ async def generate_3d_garment(
             logger.info(f"[{job_id}] Building mesh from sewing pattern panels...")
             try:
                 from mesh_utils import build_mesh_from_panels
+                # SVGs are in output_dir (valid_garment_upper/ etc), not pattern_dir
                 built = await asyncio.to_thread(
-                    build_mesh_from_panels, pattern_dir, glb_path, garment_type
+                    build_mesh_from_panels, output_dir, glb_path, garment_type
                 )
                 if built:
                     logger.info(f"[{job_id}] Panel mesh created successfully")
@@ -660,8 +661,13 @@ async def generate_3d_garment(
     logger.info(f"[{job_id}] Complete in {processing_time:.1f}s")
 
     svg_path = None
-    if pattern_dir and (pattern_dir / "pattern.svg").exists():
-        svg_path = pattern_dir / "pattern.svg"
+    # Look for SVGs in both sewing_patterns/ and output_dir/
+    for search_dir in [pattern_dir, output_dir]:
+        if search_dir:
+            svgs = list(search_dir.rglob("*_pattern.svg"))
+            if svgs:
+                svg_path = svgs[0]
+                break
 
     return {
         "mesh_path": glb_path,
