@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Amoire 3D Demo — Mesh Utilities
 
@@ -16,12 +18,83 @@ import trimesh
 from config import CACHE_DIR, OUTPUT_DIR
 
 
-def obj_to_glb(obj_path: Path, glb_path: Optional[Path] = None) -> Path:
-    """Convert OBJ mesh to GLB (web-friendly binary glTF format)."""
+def post_process_mesh(
+    mesh: "trimesh.Trimesh", smooth_iterations: int = 10
+) -> "trimesh.Trimesh":
+    """Apply Taubin smoothing and recompute smooth vertex normals.
+
+    Taubin smoothing (alternating lambda/mu passes) preserves mesh volume
+    unlike Laplacian smoothing which shrinks garment silhouettes. Each step
+    is wrapped in try/except so a failure never crashes the pipeline.
+
+    Args:
+        mesh: Input trimesh object (modified in-place and returned).
+        smooth_iterations: Number of Taubin smoothing passes. 10 is a good
+            balance for 10K-22K vertex garment meshes — removes faceting
+            without losing geometric detail at collars/hems/cuffs.
+
+    Returns:
+        The processed mesh with smooth normals.
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    # Step 1: Fix inconsistent face winding from simulation output.
+    # This is a prerequisite for correct normal computation.
+    try:
+        trimesh.repair.fix_normals(mesh)
+    except Exception as e:
+        logger.warning(f"fix_normals failed (non-fatal): {e}")
+
+    # Step 2: Taubin smoothing — lamb=0.5 controls smoothing strength,
+    # nu=0.5 controls the anti-shrinkage pass. Together they remove faceting
+    # while keeping garment proportions intact.
+    try:
+        trimesh.smoothing.filter_taubin(
+            mesh, lamb=0.5, nu=0.5, iterations=smooth_iterations
+        )
+        logger.info(f"Applied Taubin smoothing ({smooth_iterations} iterations)")
+    except Exception as e:
+        logger.warning(f"Taubin smoothing failed (non-fatal): {e}")
+
+    # Step 3: Force smooth vertex normal computation. Accessing the property
+    # triggers area-weighted averaging of face normals at each vertex,
+    # replacing per-face flat normals with interpolated smooth normals.
+    try:
+        _ = mesh.vertex_normals
+        logger.info(
+            f"Recomputed smooth vertex normals ({len(mesh.vertices)} vertices)"
+        )
+    except Exception as e:
+        logger.warning(f"Vertex normal computation failed (non-fatal): {e}")
+
+    return mesh
+
+
+def obj_to_glb(
+    obj_path: Path, glb_path: Optional[Path] = None, smooth: bool = True
+) -> Path:
+    """Convert OBJ mesh to GLB with optional smoothing post-processing.
+
+    Loads the mesh as geometry (not scene) so smoothing and normal
+    recomputation can be applied before export. The processed mesh is
+    then wrapped in a Scene for proper GLB material embedding.
+
+    Args:
+        obj_path: Input OBJ file path.
+        glb_path: Output GLB file path (defaults to same name with .glb).
+        smooth: If True, apply Taubin smoothing and recompute vertex normals.
+    """
     if glb_path is None:
         glb_path = obj_path.with_suffix(".glb")
 
-    scene = trimesh.load(str(obj_path), force="scene")
+    mesh = trimesh.load(str(obj_path), force="mesh", process=False)
+
+    if smooth:
+        mesh = post_process_mesh(mesh)
+
+    scene = trimesh.Scene(mesh)
     scene.export(str(glb_path), file_type="glb")
     return glb_path
 

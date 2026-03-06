@@ -125,6 +125,19 @@ export default function GarmentViewer({
       hemiLight.diffuse = new BABYLON.Color3(1, 1, 1);
       hemiLight.groundColor = new BABYLON.Color3(0.8, 0.8, 0.82);
 
+      // Environment texture for PBR reflections. Without this, PBR
+      // materials (especially sheen) lose physically-based behavior.
+      try {
+        const envTexture = BABYLON.CubeTexture.CreateFromPrefilteredData(
+          "https://assets.babylonjs.com/environments/environmentSpecular.env",
+          scene,
+        );
+        scene.environmentTexture = envTexture;
+        scene.environmentIntensity = 0.3;
+      } catch {
+        // Non-fatal — viewer works without environment reflections
+      }
+
       // Shadow-catching ground plane (invisible but catches shadows)
       const ground = BABYLON.MeshBuilder.CreateGround(
         "ground",
@@ -233,14 +246,28 @@ export default function GarmentViewer({
           }
         }
 
-        // Apply PBR material to meshes without materials
+        // Apply PBR fabric material and ensure smooth normals
         for (const mesh of meshes) {
+          // Recompute smooth vertex normals — ensures normals survive
+          // the OBJ -> GLB -> Babylon roundtrip without flat-shading artifacts
+          if (mesh.getTotalVertices() > 0) {
+            mesh.createNormals(true);
+          }
+
           if (!mesh.material && mesh.getTotalVertices() > 0) {
             const mat = new BABYLON.PBRMaterial(`fabric_${mesh.name}`, scene);
-            mat.albedoColor = new BABYLON.Color3(0.88, 0.86, 0.84); // warm off-white
+            mat.albedoColor = new BABYLON.Color3(0.88, 0.86, 0.84);
             mat.metallic = 0;
-            mat.roughness = 0.65; // fabric-like
+            mat.roughness = 0.75; // cotton/linen is rougher than 0.65
             mat.backFaceCulling = false;
+            mat.twoSidedLighting = true; // correct lighting on thin cloth panels
+
+            // Sheen sublayer — simulates microfiber light scattering in woven fabric
+            mat.sheen.isEnabled = true;
+            mat.sheen.intensity = 0.3;
+            mat.sheen.color = new BABYLON.Color3(1.0, 0.98, 0.95);
+            mat.sheen.roughness = 0.4;
+
             mesh.material = mat;
           }
 

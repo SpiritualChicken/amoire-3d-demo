@@ -51,6 +51,12 @@ DRAPING_ENABLED = (
     or os.getenv("CONTOURCRAFT_ENABLED", "false").lower() == "true"  # backward compat
 )
 
+# UV texture generation — produces UV coordinates for garment meshes, enabling
+# texture mapping. Disabled by default due to numpy compatibility bugs in
+# pygarment's UV unwrapping. Set UV_TEXTURES_ENABLED=true after verifying
+# numpy/pygarment compatibility on your environment.
+UV_TEXTURES_ENABLED = os.getenv("UV_TEXTURES_ENABLED", "false").lower() == "true"
+
 # Ensure data directories exist
 for d in [UPLOAD_DIR, OUTPUT_DIR, CACHE_DIR]:
     d.mkdir(parents=True, exist_ok=True)

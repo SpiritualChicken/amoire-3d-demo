@@ -38,6 +38,7 @@ from config import (
     MOCK_MODE,
     OUTPUT_DIR,
     USE_4BIT_QUANTIZATION,
+    UV_TEXTURES_ENABLED,
 )
 
 logger = logging.getLogger(__name__)
@@ -339,6 +340,16 @@ def _run_vlm_inference(image_path: Path) -> tuple[str, dict, object]:
 
     if float_preds is not None:
         logger.info(f"Float predictions shape: {float_preds.shape}")
+        # Log per-[SEG]-token statistics to diagnose model collapse
+        fp_cpu = float_preds.detach().cpu().float()
+        for seg_idx in range(fp_cpu.shape[0]):
+            vals = fp_cpu[seg_idx]
+            logger.info(
+                f"  [SEG] token {seg_idx}: "
+                f"min={vals.min().item():.4f}, max={vals.max().item():.4f}, "
+                f"mean={vals.mean().item():.4f}, std={vals.std().item():.4f}, "
+                f"first_5={[round(v, 4) for v in vals[:5].tolist()]}"
+            )
     else:
         logger.warning("No [SEG] tokens found — float_preds is None")
 
@@ -346,7 +357,7 @@ def _run_vlm_inference(image_path: Path) -> tuple[str, dict, object]:
     garment_json = _parse_model_json(json_text)
     logger.info(f"Parsed garment JSON keys: {list(garment_json.keys())}")
 
-    return description, garment_json, float_preds
+    return description, garment_json, float_preds, json_text
 
 
 def _parse_model_json(text: str) -> dict:
@@ -524,6 +535,17 @@ def _run_warp_simulation(spec_files: list[Path], output_dir: Path) -> Path:
     # On headless servers, use OSMesa for off-screen rendering.
     os.environ.setdefault("PYOPENGL_PLATFORM", "osmesa")
 
+    # Restore deprecated numpy type aliases removed in numpy 1.24+.
+    # Older pygarment code (UV unwrapping, mesh operations) uses np.float,
+    # np.int, np.bool which were removed from numpy.
+    import numpy as _np
+    if not hasattr(_np, "float"):
+        _np.float = _np.float64
+    if not hasattr(_np, "int"):
+        _np.int = _np.int64
+    if not hasattr(_np, "bool"):
+        _np.bool = _np.bool_
+
     for p in [str(GARMENTCODE_DIR), str(CHATGARMENT_DIR)]:
         if p not in sys.path:
             sys.path.insert(0, p)
@@ -571,10 +593,24 @@ def _run_warp_simulation(spec_files: list[Path], output_dir: Path) -> Path:
             resolution = props["sim"]["config"]["resolution_scale"]
             garment_box_mesh = BoxMesh(paths.in_g_spec, resolution)
             garment_box_mesh.load()
-            garment_box_mesh.serialize(
-                paths, store_panels=False,
-                uv_config=None,  # Skip UV unwrapping — not needed for simulation
-            )
+
+            # UV texture generation — conditionally enabled via config flag.
+            # Falls back to no-UV serialization if it fails (numpy compat bugs).
+            uv_cfg = props["render"]["config"]["uv_texture"] if UV_TEXTURES_ENABLED else None
+            try:
+                garment_box_mesh.serialize(
+                    paths, store_panels=False,
+                    uv_config=uv_cfg,
+                )
+            except Exception as e:
+                if uv_cfg is not None:
+                    logger.warning(f"UV texture serialization failed, retrying without UVs: {e}")
+                    garment_box_mesh.serialize(
+                        paths, store_panels=False,
+                        uv_config=None,
+                    )
+                else:
+                    raise
             props.serialize(paths.element_sim_props)
 
             # Run FEM cloth simulation (drapes panels onto body)
@@ -582,18 +618,20 @@ def _run_warp_simulation(spec_files: list[Path], output_dir: Path) -> Path:
                 garment_box_mesh.name,
                 props,
                 paths,
-                save_v_norms=False,
+                save_v_norms=True,
                 store_usd=False,
                 optimize_storage=False,
                 verbose=False,
             )
             props.serialize(paths.element_sim_props)
 
-            # Load the draped result
+            # Load the draped result. process=True merges duplicate vertices
+            # at panel seams and unifies face winding — prerequisites for
+            # correct smooth normal computation during GLB export.
             sim_obj_path = Path(paths.g_sim)
             if sim_obj_path.exists():
                 logger.info(f"  Simulation complete: {sim_obj_path}")
-                mesh = trimesh.load(str(sim_obj_path), process=False)
+                mesh = trimesh.load(str(sim_obj_path), process=True)
                 draped_meshes.append(mesh)
             else:
                 logger.warning(f"  Simulation output not found at {sim_obj_path}")
@@ -686,15 +724,23 @@ async def generate_3d_garment(
     if progress_callback:
         await progress_callback("analyzing", 10)
     logger.info(f"[{job_id}] Running VLM inference...")
-    description, garment_json, float_preds = await asyncio.to_thread(
+    description, garment_json, float_preds, raw_step2_text = await asyncio.to_thread(
         _run_vlm_inference, image_path
     )
 
-    # Save intermediate results
+    # Save intermediate results for diagnostics
     with open(output_dir / "description.txt", "w") as f:
         f.write(description)
     with open(output_dir / "garment_spec.json", "w") as f:
         json.dump(garment_json, f, indent=2)
+    with open(output_dir / "step2_raw_output.txt", "w") as f:
+        f.write(raw_step2_text)
+    if float_preds is not None:
+        import torch as _torch
+        _torch.save(float_preds.detach().cpu(), output_dir / "float_predictions.pt")
+        fp_list = float_preds.detach().cpu().float().tolist()
+        with open(output_dir / "float_predictions.json", "w") as f:
+            json.dump(fp_list, f, indent=2)
 
     # Step 3: Parse float predictions → GarmentCode specification files
     spec_files = []
@@ -707,6 +753,14 @@ async def generate_3d_garment(
                 _run_garmentcode_parser, garment_json, float_preds, output_dir
             )
             logger.info(f"[{job_id}] Generated {len(spec_files)} spec files")
+            for sf in spec_files:
+                logger.info(f"[{job_id}]   Spec: {sf.name} ({sf.stat().st_size} bytes)")
+                try:
+                    with open(sf) as _f:
+                        spec_data = json.load(_f)
+                    logger.info(f"[{job_id}]     Keys: {list(spec_data.keys())}")
+                except Exception:
+                    pass
         except Exception as e:
             logger.warning(f"[{job_id}] GarmentCode parser failed: {e}", exc_info=True)
 
