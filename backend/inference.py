@@ -595,17 +595,14 @@ def _run_warp_simulation(spec_files: list[Path], output_dir: Path) -> Path:
             garment_box_mesh.load()
 
             # UV texture generation — conditionally enabled via config flag.
-            # Falls back to no-UV serialization if it fails (numpy compat bugs).
-            # Note: uv_config=None causes TypeError in boxmeshgen, so omit it entirely.
-            serialize_kwargs = dict(store_panels=False)
-            if UV_TEXTURES_ENABLED:
-                serialize_kwargs["uv_config"] = props["render"]["config"]["uv_texture"]
+            # Pass uv_config=None to skip UV generation entirely (patched in boxmeshgen).
+            uv_cfg = props["render"]["config"]["uv_texture"] if UV_TEXTURES_ENABLED else None
             try:
-                garment_box_mesh.serialize(paths, **serialize_kwargs)
+                garment_box_mesh.serialize(paths, store_panels=False, uv_config=uv_cfg)
             except Exception as e:
-                if UV_TEXTURES_ENABLED:
+                if uv_cfg is not None:
                     logger.warning(f"UV texture serialization failed, retrying without UVs: {e}")
-                    garment_box_mesh.serialize(paths, store_panels=False)
+                    garment_box_mesh.serialize(paths, store_panels=False, uv_config=None)
                 else:
                     raise
             props.serialize(paths.element_sim_props)
