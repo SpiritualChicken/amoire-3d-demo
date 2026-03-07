@@ -554,6 +554,8 @@ def _run_warp_simulation(spec_files: list[Path], output_dir: Path) -> Path:
     from pygarment.meshgen.simulation import run_sim
     import pygarment.data_config as data_config
     from pygarment.meshgen.sim_config import PathCofig
+    import warp as wp
+    wp.set_device("cuda:0")
 
     sim_config_path = str(GARMENTCODE_DIR / "assets" / "Sim_props" / "default_sim_props.yaml")
     system_json_path = str(GARMENTCODE_DIR / "system.json")
