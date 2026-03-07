@@ -5,34 +5,24 @@ f = '/workspace/amoire-3d-demo/ml/GarmentCodeRC/pygarment/meshgen/boxmeshgen.py'
 with open(f) as fh:
     lines = fh.readlines()
 
-# Find the line with uv_config.update(in_uv_config)
-target = '        uv_config.update(in_uv_config)\n'
-idx = None
+# Find the patched None check (from previous patch) and fix it to pass [] instead of None
+old_patch = '                None,\n'
+found = False
 for i, line in enumerate(lines):
-    if line == target:
-        idx = i
+    if line == '        if in_uv_config is None:\n':
+        # Find the None argument in the save_obj call and replace with []
+        for j in range(i, min(i + 10, len(lines))):
+            if lines[j] == old_patch:
+                lines[j] = '                [],\n'
+                found = True
+                break
         break
 
-if idx is None:
-    print('ERROR: Could not find target line. Already patched?')
+if not found:
+    print('ERROR: Could not find previous patch to fix. Was it applied?')
     sys.exit(1)
-
-# Insert the None check before that line
-patch_lines = [
-    '        if in_uv_config is None:\n',
-    '            save_obj(\n',
-    '                self.paths.g_box_mesh,\n',
-    '                self.vertices,\n',
-    '                self.faces_with_texture,\n',
-    '                None,\n',
-    '                vert_normals=self.eval_vertex_normals() if with_normals else None,\n',
-    '            )\n',
-    '            return\n',
-]
-
-lines[idx:idx] = patch_lines
 
 with open(f, 'w') as fh:
     fh.writelines(lines)
 
-print('Patched successfully!')
+print('Patched: save_obj now gets [] instead of None for UVs')
